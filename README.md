@@ -26,13 +26,13 @@ All projects use OpenCV and pre-trained models. No GPU and no pip packages are r
 
 ## Setup on a fresh Pi
 
-    git clone <repository url>
-    cd cv-course
+    git clone https://github.com/GC-STEM/cs460-poc.git
+    cd cs460-poc
     bash setup.sh
 
 ## How to run
 
-Run every command from inside the cv-course folder, because the scripts load the models with relative paths.
+Run every command from inside the cs460-poc folder, because the scripts load the models with relative paths.
 If you are connected over SSH, put DISPLAY=:0 in front of the command so the window opens on the Pi desktop.
 Press q in the window to quit.
 
