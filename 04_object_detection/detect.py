@@ -1,60 +1,82 @@
 import cv2
-import numpy as np
 from picamera2 import Picamera2
-from nanodet import NanoDet      # helper from OpenCV's model zoo: runs the net and decodes the boxes
+from picamera2.devices import IMX500
 
 W, H = 640, 480
-SIZE = 416                        # the network's input size (square)
+MODEL = "/usr/share/imx500-models/imx500_network_nanodet_plus_416x416_pp.rpk"
+THRESHOLD = 0.35
 
-CLASSES = ('person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
-           'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
-           'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
-           'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
-           'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
-           'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
-           'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
-           'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
-           'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
-           'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
-           'toothbrush')
+CLASSES = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+    "toothbrush",
+)
 
-model = NanoDet(modelPath="models/nanodet.onnx", prob_threshold=0.35, iou_threshold=0.6,
-                backend_id=cv2.dnn.DNN_BACKEND_OPENCV, target_id=cv2.dnn.DNN_TARGET_CPU)
+# The post-processed NanoDet network runs on the IMX500 accelerator in the AI Camera.
+imx500 = IMX500(MODEL)
+intrinsics = imx500.network_intrinsics
+if intrinsics is None:
+    raise RuntimeError("IMX500 model intrinsics are missing; reinstall the imx500-all package")
+intrinsics.update_with_defaults()
+labels = intrinsics.labels or list(CLASSES)
 
-# Our frame is 640x480 but the network wants 416x416, so we shrink it to 416 wide
-# and pad the top and bottom with black bars (a "letterbox"). These numbers undo that later.
-scale = SIZE / W                  # 0.65
-new_h = int(H * scale)            # 312
-top = (SIZE - new_h) // 2         # 52 px of black above and below
-
-cam = Picamera2()
-cam.configure(cam.create_preview_configuration(main={"format": "RGB888", "size": (W, H)}))
+cam = Picamera2(imx500.camera_num)
+config = cam.create_preview_configuration(
+    main={"format": "RGB888", "size": (W, H)},
+    controls={"FrameRate": intrinsics.inference_rate},
+    buffer_count=12,
+)
+cam.configure(config)
+imx500.show_network_fw_progress_bar()
 cam.start()
-timer = cv2.TickMeter()
+if intrinsics.preserve_aspect_ratio:
+    imx500.set_auto_aspect_ratio()
 
+last_detections = []
 while True:
-    frame = cam.capture_array()
+    with cam.captured_request() as request:
+        frame = request.make_array("main")
+        metadata = request.get_metadata()
+        outputs = imx500.get_outputs(metadata, add_batch=True)
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    small = cv2.resize(rgb, (SIZE, new_h), interpolation=cv2.INTER_AREA)
-    boxed = cv2.copyMakeBorder(small, top, SIZE - new_h - top, 0, 0, cv2.BORDER_CONSTANT, value=0)
+        if outputs is not None:
+            boxes, scores, classes = outputs[0][0], outputs[1][0], outputs[2][0]
+            input_w, input_h = imx500.get_input_size()
 
-    timer.start()
-    preds = model.infer(boxed)    # each row: x1, y1, x2, y2, confidence, class id
-    timer.stop()
+            if intrinsics.bbox_normalization:
+                boxes = boxes / input_h
+            if intrinsics.bbox_order == "xy":
+                boxes = boxes[:, [1, 0, 3, 2]]
 
-    for p in preds:
-        x1 = int(p[0] / scale)
-        y1 = int((p[1] - top) / scale)
-        x2 = int(p[2] / scale)
-        y2 = int((p[3] - top) / scale)
-        conf, cls = p[4], int(p[5])
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, f"{CLASSES[cls]} {conf:.2f}", (x1, max(y1 - 8, 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            last_detections = []
+            for box, score, category in zip(boxes, scores, classes):
+                if score <= THRESHOLD:
+                    continue
+                x, y, w, h = imx500.convert_inference_coords(box, metadata, cam)
+                last_detections.append((x, y, w, h, int(category), float(score)))
 
-    cv2.putText(frame, f"{timer.getFPS():.1f} fps   q = quit", (10, H - 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+    for x, y, w, h, category, score in last_detections:
+        name = labels[category] if category < len(labels) else str(category)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(
+            frame,
+            f"{name} {score:.2f}",
+            (x, max(y - 8, 15)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
+
+    cv2.putText(frame, "q = quit", (10, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
     cv2.imshow("Object detection", frame)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
